@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>دمج الصور - تحويل تلقائي للنسب غير المدعومة</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="images/logo.svg">
+</head>
+<body>
+
+<main class="app">
+  <h2>📐 دمج ذكي مع تحويل تلقائي للنسب غير المدعومة</h2>
+  <p class="subtitle">ارفع صوراً (حتى 10 صور) وسيتم اختيار القالب المناسب أو تحويل الصورة لأقرب نسبة مدعومة</p>
+  <p class="subtitle" style="color: #094239; font-size: 17px; font-weight: bold;">✅ النسب المدعومة: 4:3 , 3:4 , 16:9 , 9:16 , 5:4 , 4:5 , 1:1</p>
+  
+  <input type="text" id="titleInput" placeholder="عنوان الصور (اختياري)" style="margin-bottom: 10px;">
+  <br>
+  <input type="file" id="upload" accept="image/*" multiple>
+  <br>
+  <button id="processBtn">🎨 معالجة وتحميل الصور</button>
+  <div id="downloads"></div>
+  <div id="advancedSettings" style="margin-top:20px;"></div>
+</main>
+
+<script>
+// ----------------------------------------------
+// قائمة النسب المدعومة مع اسم ملف القالب المناسب
+// ----------------------------------------------
+const ASPECT_RULES = [
+  { key: '4_3',   ratio: 4/3,    label: '4:3',    overlayFile: 'templates/overlay_4_3.png' },
+  { key: '3_4',   ratio: 3/4,    label: '3:4',    overlayFile: 'templates/overlay_3_4.png' },
+  { key: '16_9',  ratio: 16/9,   label: '16:9',   overlayFile: 'templates/overlay_16_9.png' },
+  { key: '9_16',  ratio: 9/16,   label: '9:16',   overlayFile: 'templates/overlay_9_16.png' },
+  { key: '5_4',   ratio: 5/4,    label: '5:4',    overlayFile: 'templates/overlay_5_4.png' },
+  { key: '4_5',   ratio: 4/5,    label: '4:5',    overlayFile: 'templates/overlay_4_5.png' },
+  { key: '1_1',   ratio: 1,      label: '1:1',    overlayFile: 'templates/overlay_1_1.png' }
+];
+
+const TOLERANCE = 0.012;
+
+// إيجاد أقرب قاعدة نسبة (للاستخدام التلقائي)
+function getClosestAspectRule(ratio) {
+  let closest = ASPECT_RULES[0];
+  let minDiff = Math.abs(closest.ratio - ratio);
+  for (let i = 1; i < ASPECT_RULES.length; i++) {
+    const diff = Math.abs(ASPECT_RULES[i].ratio - ratio);
+    if (diff < minDiff) {
+      minDiff = diff;
+      closest = ASPECT_RULES[i];
+    }
+  }
+  return closest;
+}
+
+// دالة لتحويل الصورة إلى نسبة محددة (طريقة Cover: ملء الإطار بالكامل وقص الزوائد)
+function resizeImageToExactRatio(img, targetRatio) {
+  const srcWidth = img.width;
+  const srcHeight = img.height;
+  const srcRatio = srcWidth / srcHeight;
+  
+  let targetWidth, targetHeight;
+  let dx = 0, dy = 0;
+  
+  if (srcRatio > targetRatio) {
+    // الصورة أعرض من الهدف: نضبط الارتفاع ونقص العرض من الجوانب
+    targetHeight = srcHeight;
+    targetWidth = targetHeight * targetRatio;
+    dx = (srcWidth - targetWidth) / 2;
+    dy = 0;
+  } else {
+    // الصورة أطول من الهدف: نضبط العرض ونقص الارتفاع
+    targetWidth = srcWidth;
+    targetHeight = targetWidth / targetRatio;
+    dx = 0;
+    dy = (srcHeight - targetHeight) / 2;
+  }
+  
+  const canvas = document.createElement('canvas');
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, dx, dy, targetWidth, targetHeight, 0, 0, targetWidth, targetHeight);
+  
+  // إعادة الصورة الجديدة كـ HTMLImageElement
+  return new Promise((resolve) => {
+    const newImg = new Image();
+    newImg.onload = () => resolve(newImg);
+    newImg.src = canvas.toDataURL();
+  });
+}
+
+// دالة الكشف الأساسية (تعيد القاعدة المطابقة أو null إن لم تكن مدعومة)
+function getMatchingOverlayInfo(width, height) {
+  if (!width || !height) return null;
+  const imgRatio = width / height;
+  const matched = ASPECT_RULES.find(rule => Math.abs(rule.ratio - imgRatio) <= TOLERANCE);
+  return matched ? { ...matched, autoAdjusted: false } : null;
+}
+
+function getOverlayPath(overlayFile) {
+  return overlayFile;
+}
+
+function readFileAsDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => resolve(e.target.result);
+    reader.onerror = () => reject(new Error("file_read_error"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error(`فشل تحميل: ${src}`));
+    img.src = src;
+  });
+}
+
+// رسم الصورة النهائية بعد أي تعديل تلقائي + تطبيق التحريك والتكبير
+async function drawMergedImage(originalImage, overlayImg, index, forceTargetRatio = null) {
+  let workingImage = originalImage;
+  let usedRule = null;
+  
+  // كشف النسبة الأصلية
+  const originalRatio = originalImage.width / originalImage.height;
+  const exactMatch = getMatchingOverlayInfo(originalImage.width, originalImage.height);
+  
+  if (exactMatch) {
+    usedRule = exactMatch;
+  } else if (forceTargetRatio) {
+    // تم تمرير النسبة المستهدفة (من المعاينة أو المعالجة)
+    usedRule = ASPECT_RULES.find(r => Math.abs(r.ratio - forceTargetRatio) <= TOLERANCE);
+    if (usedRule) {
+      workingImage = await resizeImageToExactRatio(originalImage, usedRule.ratio);
+    }
+  } else {
+    // أقرب قاعدة
+    const closest = getClosestAspectRule(originalRatio);
+    usedRule = closest;
+    workingImage = await resizeImageToExactRatio(originalImage, closest.ratio);
+  }
+  
+  const canvas = document.createElement("canvas");
+  const scaleControl = document.getElementById(`scale_${index}`);
+  const xControl = document.getElementById(`x_${index}`);
+  const yControl = document.getElementById(`y_${index}`);
+
+  const scale = scaleControl ? parseFloat(scaleControl.value) : 1;
+  const offsetX = xControl ? parseInt(xControl.value) : 0;
+  const offsetY = yControl ? parseInt(yControl.value) : 0;
+
+  canvas.width = workingImage.width;
+  canvas.height = workingImage.height;
+  const ctx = canvas.getContext("2d");
+
+  const newWidth = workingImage.width * scale;
+  const newHeight = workingImage.height * scale;
+  const centerX = (canvas.width - newWidth) / 2 + offsetX;
+  const centerY = (canvas.height - newHeight) / 2 + offsetY;
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(workingImage, centerX, centerY, newWidth, newHeight);
+  ctx.drawImage(overlayImg, 0, 0, canvas.width, canvas.height);
+
+  return { dataURL: canvas.toDataURL("image/jpeg", 0.92), usedRule, autoAdjusted: !exactMatch };
+}
+
+// معالجة الصور وتحميلها مع استخدام العنوان المدخل
+async function processImages() {
+  const files = document.getElementById("upload").files;
+  const downloadsDiv = document.getElementById("downloads");
+  downloadsDiv.innerHTML = "";
+  const baseTitle = document.getElementById("titleInput").value.trim() || "image";
+
+  if (!files.length) {
+    alert("📁 اختر صورًا أولاً");
+    return;
+  }
+  if (files.length > 10) {
+    alert("الحد الأقصى هو 10 صور فقط");
+    return;
+  }
+
+  let successCount = 0;
+  for (let i = 0; i < files.length; i++) {
+    try {
+      const baseSrc = await readFileAsDataURL(files[i]);
+      const originalImage = await loadImage(baseSrc);
+      
+      // تحميل القالب المناسب (قد يكون بعد التحويل التلقائي)
+      const originalRatio = originalImage.width / originalImage.height;
+      const exactMatch = getMatchingOverlayInfo(originalImage.width, originalImage.height);
+      let targetRule = exactMatch;
+      let autoAdjusted = false;
+      
+      if (!targetRule) {
+        targetRule = getClosestAspectRule(originalRatio);
+        autoAdjusted = true;
+      }
+      
+      let overlayImg;
+      try {
+        overlayImg = await loadImage(getOverlayPath(targetRule.overlayFile));
+      } catch {
+        const errMsg = document.createElement("p");
+        errMsg.style.color = "#c0392b";
+        errMsg.innerText = `⚠️ القالب ${targetRule.overlayFile} مفقود للصورة ${i+1}.`;
+        downloadsDiv.appendChild(errMsg);
+        continue;
+      }
+      
+      const { dataURL, usedRule } = await drawMergedImage(originalImage, overlayImg, i, autoAdjusted ? targetRule.ratio : null);
+      const finalLabel = autoAdjusted ? `${usedRule.label} (تم التحويل)` : usedRule.label;
+      const fileName = `${baseTitle}_${i+1}.png`;
+      const link = document.createElement("a");
+      link.href = dataURL;
+      link.download = fileName;
+      link.textContent = `📥 تنزيل ${fileName} (قالب ${finalLabel})`;
+      if (autoAdjusted) link.style.backgroundColor = "#fff3cd";
+      downloadsDiv.appendChild(link);
+      setTimeout(() => link.click(), i * 150);
+      successCount++;
+    } catch (err) {
+      const errPara = document.createElement("p");
+      errPara.textContent = `💥 خطأ في الصورة ${i+1}: ${err.message}`;
+      errPara.style.color = "brown";
+      downloadsDiv.appendChild(errPara);
+    }
+  }
+  if (successCount === 0 && files.length) alert("⚠️ لم تتم معالجة أي صورة (قوالب مفقودة أو مشكلة في التحويل).");
+  else if (successCount) alert(`✅ تمت معالجة ${successCount} صورة بنجاح`);
+}
+
+// ------------------ المعاينة الديناميكية مع التحويل التلقائي ------------------
+async function setupPreview(index, file) {
+  const baseSrc = await readFileAsDataURL(file);
+  let originalImage;
+  try {
+    originalImage = await loadImage(baseSrc);
+  } catch (e) {
+    console.warn("خطأ في تحميل صورة المعاينة", e);
+    return;
+  }
+  
+  const originalWidth = originalImage.width, originalHeight = originalImage.height;
+  const originalRatio = originalWidth / originalHeight;
+  const exactMatch = getMatchingOverlayInfo(originalWidth, originalHeight);
+  
+  let targetRule = exactMatch;
+  let autoAdjusted = false;
+  let adjustedImage = originalImage;
+  
+  if (!targetRule) {
+    targetRule = getClosestAspectRule(originalRatio);
+    autoAdjusted = true;
+    // تحويل الصورة إلى النسبة المستهدفة
+    adjustedImage = await resizeImageToExactRatio(originalImage, targetRule.ratio);
+  }
+  
+  const canvas = document.getElementById(`preview_${index}`);
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  
+  // عرض معلومات النسبة + تحذير إذا تم التحويل
+  const infoSpan = document.getElementById(`ratio_info_${index}`);
+  if (infoSpan) {
+    if (autoAdjusted) {
+      infoSpan.innerHTML = `<span class="warning-badge">⚠️ تم تحويل تلقائي من (${originalWidth}×${originalHeight}) إلى قالب ${targetRule.label}</span>`;
+    } else {
+      infoSpan.innerHTML = `📐 القالب المطابق: <strong>${targetRule.label}</strong> (دقيق)`;
+    }
+    // تمكين السلايدرات دائماً لأن الصورة الآن صالحة
+    ['scale', 'x', 'y'].forEach(s => {
+      const el = document.getElementById(`${s}_${index}`);
+      if(el) el.disabled = false;
+    });
+  }
+  
+  // تحميل القالب
+  let overlayImg = null;
+  try {
+    overlayImg = await loadImage(getOverlayPath(targetRule.overlayFile));
+  } catch (err) {
+    console.error("فشل تحميل قالب المعاينة", err);
+    ctx.fillStyle = "#d99";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#fff";
+    ctx.fillText("قالب مفقود!", 20, 40);
+    return;
+  }
+  
+  // ضبط أبعاد Canvas المعاينة لتناسب نسبة القالب المستخدمة (بدون تشويه)
+  const maxWidth = 320;
+  const maxHeight = 240;
+  let canvasWidth = adjustedImage.width, canvasHeight = adjustedImage.height;
+  if (canvasWidth > maxWidth) {
+    canvasHeight = (canvasHeight * maxWidth) / canvasWidth;
+    canvasWidth = maxWidth;
+  }
+  if (canvasHeight > maxHeight) {
+    canvasWidth = (canvasWidth * maxHeight) / canvasHeight;
+    canvasHeight = maxHeight;
+  }
+  canvas.width = canvasWidth;
+  canvas.height = canvasHeight;
+  canvas.style.width = `${canvasWidth}px`;
+  canvas.style.height = `${canvasHeight}px`;
+  
+  function updatePreview() {
+    if (!overlayImg) return;
+    const scale = parseFloat(document.getElementById(`scale_${index}`)?.value || 1);
+    const offsetX = parseInt(document.getElementById(`x_${index}`)?.value || 0);
+    const offsetY = parseInt(document.getElementById(`y_${index}`)?.value || 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    const drawWidth = canvas.width * scale;
+    const drawHeight = canvas.height * scale;
+    const dx = (canvas.width - drawWidth) / 2 + offsetX;
+    const dy = (canvas.height - drawHeight) / 2 + offsetY;
+    ctx.drawImage(adjustedImage, dx, dy, drawWidth, drawHeight);
+    ctx.drawImage(overlayImg, 0, 0, canvas.width, canvas.height);
+  }
+  
+  updatePreview();
+  document.getElementById(`scale_${index}`)?.addEventListener("input", updatePreview);
+  document.getElementById(`x_${index}`)?.addEventListener("input", updatePreview);
+  document.getElementById(`y_${index}`)?.addEventListener("input", updatePreview);
+}
+
+function generateControls() {
+  const files = document.getElementById("upload").files;
+  const container = document.getElementById("advancedSettings");
+  container.innerHTML = "";
+  if (!files.length) return;
+
+  for (let i = 0; i < files.length; i++) {
+    const div = document.createElement("div");
+    div.style.cssText = "border:1px solid #cbc3aa; border-radius:16px; padding:16px; margin:12px 0; background:#fefcf7;";
+    div.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap;">
+        <p style="font-weight:bold; margin:0 0 8px 0;"> الصورة ${i+1} <span id="ratio_info_${i}" class="ratio-badge"></span></p>
+      </div>
+      <div class="editor-row">
+        <canvas id="preview_${i}" class="preview-canvas"></canvas>
+        <div class="controls">
+          <label>🔍 تكبير/تصغير: <span id="scale_val_${i}">1.00</span></label>
+          <input type="range" min="0.5" max="2" step="0.01" value="1" id="scale_${i}">
+          <label>⬅️➡️ تحريك أفقي</label>
+          <input type="range" min="-250" max="250" value="0" id="x_${i}">
+          <label>⬆️⬇️ تحريك عمودي</label>
+          <input type="range" min="-250" max="250" value="0" id="y_${i}">
+        </div>
+      </div>
+    `;
+    container.appendChild(div);
+
+    const scaleSlider = document.getElementById(`scale_${i}`);
+    if (scaleSlider) {
+      scaleSlider.addEventListener("input", (e) => {
+        const valSpan = document.getElementById(`scale_val_${i}`);
+        if (valSpan) valSpan.innerText = parseFloat(e.target.value).toFixed(2);
+      });
+    }
+    setupPreview(i, files[i]);
+  }
+}
+
+// ربط الأحداث
+document.getElementById("processBtn")?.addEventListener("click", processImages);
+document.getElementById("upload")?.addEventListener("change", generateControls);
+
+window.addEventListener("DOMContentLoaded", () => {
+  console.log("تم التحميل - تحويل تلقائي للنسب غير المدعومة");
+});
+</script>
+</body>
+</html>
